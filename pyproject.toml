@@ -1,0 +1,53 @@
+[project]
+name = "vlc-mobile-librarian"
+version = "0.1.0"
+description = "Sync local music to VLC iPhone app via Wi-Fi"
+readme = "README.md"
+authors = [
+    { name = "Tyler Bigler", email = "17618971+tyler-8@users.noreply.github.com" },
+]
+requires-python = ">=3.13"
+dependencies = [
+    "streamlit>=1.56.0",
+    "requests>=2.33.1",
+    "requests-toolbelt>=1.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "coverage>=7.13.5",
+    "ruff>=0.15.10",
+    "pytest-cov>=7.1.0",
+    "pytest-mock>=3.15.1",
+    "responses>=0.26.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+vlc-librarian = "vlc_mobile_librarian.__main__:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+]

@@ -1,0 +1,27 @@
+services:
+  vlc-mobile-librarian:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Live-reload: reflects code changes without rebuilding the image
+      - .:/app
+      # Preserve the venv built into the image (would be hidden by the bind mount above)
+      - /app/.venv
+
+      # Persists VLC connection settings and track-type config between restarts
+      - app-config:/root/.config/vlc-mobile-librarian
+
+      # Mount your Windows drives so the app can read audio files.
+      # The paths in your MediaMonkey library resolve to /mnt/<drive>/... on Linux/WSL2,
+      # so mount the same paths here. Uncomment and adjust as needed:
+      - /mnt/c:/mnt/c:ro
+      - /mnt/d:/mnt/d:ro
+      # To override the MediaMonkey DB path, add an environment section:
+    environment:
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      # - MM_DB_PATH: /mnt/d/Users/YourName/AppData/Roaming/MediaMonkey5/MM5.DB
+      # If /mnt/c is mounted above, auto-detection handles the standard AppData location.
+
+volumes:
+  app-config:
