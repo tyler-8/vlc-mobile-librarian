@@ -73,7 +73,7 @@ A named Docker volume (`app-config`) stores your VLC connection settings and tra
 ## Usage
 
 ```bash
-uv run streamlit run src/vlc_mobile_librarian/app.py
+uv run vlc-librarian
 ```
 
 Then open [http://localhost:8501](http://localhost:8501) in your browser.
@@ -96,7 +96,7 @@ Then open [http://localhost:8501](http://localhost:8501) in your browser.
 
 - **Custom DB path** - set the `MM_DB_PATH` environment variable to skip auto-discovery and use a specific database file:
   ```bash
-  MM_DB_PATH="/mnt/d/Users/me/AppData/Roaming/MediaMonkey5/MM5.DB" uv run streamlit run src/vlc_mobile_librarian/app.py
+  MM_DB_PATH="/mnt/d/Users/me/AppData/Roaming/MediaMonkey5/MM5.DB" uv run vlc-librarian
   ```
 - **Duplicate detection** is by filename only (case-sensitive). `Song.mp3` and `song.mp3` are treated as different files.
 - **No delete support** - VLC's Wi-Fi sharing API has no delete endpoint. Remove files from within the VLC app on your phone.
