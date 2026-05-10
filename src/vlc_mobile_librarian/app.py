@@ -18,9 +18,12 @@ from vlc_mobile_librarian.library import (
     LocalFile,
     Playlist,
     SyncPlan,
+    build_vlc_index,
+    classify_local_file,
     compute_sync_plan,
     find_potential_duplicates,
     generate_m3u8,
+    match_device_file,
 )
 from vlc_mobile_librarian.models import LibraryCategory
 from vlc_mobile_librarian.sources import AVAILABLE_SOURCES, LibrarySource
@@ -90,6 +93,7 @@ ss.setdefault("vlc_session", None)  # requests.Session | None
 ss.setdefault("vlc_files", None)  # list[VLCFile] | None
 ss.setdefault("sync_plan", None)  # SyncPlan | None
 ss.setdefault("selected_names", [])  # list[str] - filenames chosen for upload
+ss.setdefault("likely_overrides", [])  # list[str] - filenames from likely_present opted-in
 ss.setdefault("upload_job", None)  # UploadJob | None
 ss.setdefault("filter_text", "")  # search filter for the "to upload" list
 ss.setdefault("existing_filter_text", "")  # search filter for the "already on device" list
@@ -501,27 +505,32 @@ with st.expander("Track Type Configuration"):
 
 # ── Device Duplicates ─────────────────────────────────────────────────────────
 
-_dup_groups = find_potential_duplicates(ss.vlc_files)
+_dup_report = find_potential_duplicates(ss.vlc_files)
+_dup_total = _dup_report.total
 _dup_label = (
-    f"Device Duplicates - {len(_dup_groups)} group(s) found"
-    if _dup_groups
+    f"Device Duplicates - {_dup_total} group(s) found"
+    if _dup_total
     else "Device Duplicates - none found"
 )
-with st.expander(_dup_label, expanded=bool(_dup_groups)):
-    if not _dup_groups:
+with st.expander(_dup_label, expanded=bool(_dup_total)):
+    if not _dup_total:
         st.caption("No potential duplicates detected on the device.")
     else:
         st.caption(
-            "VLC appends -N to filenames when the same file is uploaded more than once. "
-            "The files below share a base name and may be duplicates."
+            "Detected by comparing metadata title (with duration as tiebreaker) "
+            "and by VLC's -N filename suffix. **High** = same title + matching "
+            "duration. **Medium** = same title, different durations (may be "
+            "distinct songs that share a name). **Filename** = VLC -N suffix match."
         )
         _dup_rows = [
             {
-                "Canonical Name": canonical,
-                "Files on Device": ", ".join(f.filename for f in files),
-                "Count": len(files),
+                "Confidence": g.confidence,
+                "Key": g.key,
+                "Files on Device": ", ".join(f.filename for f in g.files),
+                "Count": len(g.files),
+                "Reason": g.reason,
             }
-            for canonical, files in sorted(_dup_groups.items())
+            for g in (*_dup_report.high, *_dup_report.medium, *_dup_report.filename)
         ]
         st.dataframe(pd.DataFrame(_dup_rows), hide_index=True, width="stretch")
 
@@ -643,6 +652,40 @@ with tab_tracks:
         else:
             st.info(f"No {source_cls.name} tracks are on the device yet.")
 
+    # -- Likely already on device (full-width below the two columns) --
+
+    if plan.likely_present:
+        st.divider()
+        likely_label = (
+            f"Likely already on device - {len(plan.likely_present)}  "
+            "(metadata title + duration match a device file)"
+        )
+        with st.expander(likely_label, expanded=False):
+            st.caption(
+                "These local files have a different filename than anything on the "
+                "device, but their metadata title and duration match a device file. "
+                "By default they are **not** uploaded. Check items below to override "
+                "and upload anyway."
+            )
+            ss.likely_overrides = st.multiselect(
+                "Upload these despite the title/duration match",
+                options=[f.name for f in plan.likely_present],
+                default=[
+                    n for n in ss.likely_overrides if n in {f.name for f in plan.likely_present}
+                ],
+                label_visibility="collapsed",
+            )
+            df_likely = pd.DataFrame(
+                {
+                    "Title": [f.title or f.name for f in plan.likely_present],
+                    "Artist": [f.artist for f in plan.likely_present],
+                    "Album": [f.album for f in plan.likely_present],
+                    "Filename": [f.name for f in plan.likely_present],
+                    "Size": [_fmt_size(f.size) for f in plan.likely_present],
+                }
+            )
+            st.dataframe(df_likely, width="stretch", hide_index=True)
+
     # ── Phase 4: Upload ───────────────────────────────────────────────────────
 
     st.divider()
@@ -652,21 +695,34 @@ with tab_tracks:
     selected_files: list[LocalFile] = [
         name_to_file[n] for n in ss.selected_names if n in name_to_file
     ]
+    # Append any opted-in likely_present overrides
+    likely_by_name: dict[str, LocalFile] = {f.name: f for f in plan.likely_present}
+    override_files: list[LocalFile] = [
+        likely_by_name[n] for n in ss.likely_overrides if n in likely_by_name
+    ]
+    upload_files: list[LocalFile] = selected_files + override_files
 
-    total_size = sum(f.size for f in selected_files)
-    upload_label = (
-        f"Upload {len(selected_files)} file(s)  ({_fmt_size(total_size)})"
-        if selected_files
-        else "Upload"
-    )
+    total_size = sum(f.size for f in upload_files)
+    if override_files:
+        upload_label = (
+            f"Upload {len(upload_files)} file(s) "
+            f"({len(selected_files)} new + {len(override_files)} overridden)  "
+            f"({_fmt_size(total_size)})"
+        )
+    else:
+        upload_label = (
+            f"Upload {len(upload_files)} file(s)  ({_fmt_size(total_size)})"
+            if upload_files
+            else "Upload"
+        )
     upload_clicked = st.button(
         upload_label,
         type="primary",
-        disabled=not selected_files or ss.upload_job is not None,
+        disabled=not upload_files or ss.upload_job is not None,
     )
 
-    if upload_clicked and selected_files:
-        ss.upload_job = start_upload_job(selected_files, ss.vlc_conn)
+    if upload_clicked and upload_files:
+        ss.upload_job = start_upload_job(upload_files, ss.vlc_conn)
 
     # -- Progress rendering --
 
@@ -689,6 +745,7 @@ with tab_tracks:
             if st.button("Clear & refresh device file list"):
                 ss.upload_job = None
                 ss.selected_names = []
+                ss.likely_overrides = []
                 with st.spinner("Refreshing…"):
                     try:
                         ss.vlc_files = fetch_file_list(ss.vlc_conn, ss.vlc_session)
@@ -712,7 +769,7 @@ with tab_playlists:
         )
     else:
         playlists: list[Playlist] = ss.playlists
-        vlc_names: set[str] = {f.filename for f in (ss.vlc_files or [])}
+        vlc_index = build_vlc_index(ss.vlc_files or [])
 
         if not playlists:
             st.info(f"No playlists found in the {source_cls.name} library.")
@@ -725,12 +782,17 @@ with tab_playlists:
             selected_ids: set[int] = set(ss.selected_playlist_ids)
 
             for pl in playlists:
-                tracks_new = [t for t in pl.tracks if t.file.name not in vlc_names]
-                tracks_existing = [t for t in pl.tracks if t.file.name in vlc_names]
+                track_kinds = [classify_local_file(t.file, vlc_index) for t in pl.tracks]
+                paired = list(zip(pl.tracks, track_kinds, strict=True))
+                tracks_new = [t for t, k in paired if k == "new"]
+                tracks_existing = [t for t, k in paired if k == "already_on_device"]
+                tracks_likely = [t for t, k in paired if k == "likely_present"]
                 badge = "Auto" if pl.is_auto else "Static"
                 header = (
                     f"{pl.name}  ·  {badge}  ·  {len(pl.tracks)} track(s)"
-                    f"  ({len(tracks_new)} to upload, {len(tracks_existing)} on device)"
+                    f"  ({len(tracks_new)} to upload, {len(tracks_existing)} on device"
+                    + (f", {len(tracks_likely)} likely present" if tracks_likely else "")
+                    + ")"
                 )
                 with st.expander(header):
                     if pl.unsupported_reason:
@@ -755,16 +817,18 @@ with tab_playlists:
                             s = ms // 1000
                             return f"{s // 60}:{s % 60:02d}"
 
+                        _kind_label = {
+                            "already_on_device": "on device",
+                            "likely_present": "likely on device",
+                            "new": "upload",
+                        }
                         df_pl = pd.DataFrame(
                             {
                                 "Title": [t.file.title or t.file.name for t in pl.tracks],
                                 "Artist": [t.file.artist for t in pl.tracks],
                                 "Album": [t.file.album for t in pl.tracks],
                                 "Duration": [_fmt_duration(t.file.duration_ms) for t in pl.tracks],
-                                "Status": [
-                                    "on device" if t.file.name in vlc_names else "upload"
-                                    for t in pl.tracks
-                                ],
+                                "Status": [_kind_label[k] for k in track_kinds],
                             }
                         )
                         st.dataframe(df_pl, width="stretch", hide_index=True)
@@ -778,12 +842,18 @@ with tab_playlists:
             selected_playlists = [pl for pl in playlists if pl.id in selected_ids]
 
             if selected_playlists:
-                # Collect unique tracks needing upload (deduplicate by filename across playlists)
+                # Collect unique tracks needing upload (deduplicate by filename across playlists).
+                # Skip both exact filename matches AND likely-already-present (title+duration)
+                # matches - playlist sync defaults to conservative behavior. Likely-present
+                # overrides for individual files are handled in the Tracks tab.
                 seen: set[str] = set()
                 tracks_to_upload: list[LocalFile] = []
                 for pl in selected_playlists:
                     for track in pl.tracks:
-                        if track.file.name not in vlc_names and track.file.name not in seen:
+                        if track.file.name in seen:
+                            continue
+                        kind = classify_local_file(track.file, vlc_index)
+                        if kind == "new":
                             tracks_to_upload.append(track.file)
                             seen.add(track.file.name)
 
@@ -802,10 +872,21 @@ with tab_playlists:
             )
 
             if sync_clicked and selected_playlists:
+                # Build name overrides so the M3U8 references the device's actual
+                # filename for any track that's likely_present (different filename
+                # but same title+duration). Otherwise the playlist would reference
+                # a file that doesn't exist on the device.
+                m3u8_overrides: dict[str, str] = {}
+                for pl in selected_playlists:
+                    for track in pl.tracks:
+                        match = match_device_file(track.file, vlc_index)
+                        if match is not None and match.filename != track.file.name:
+                            m3u8_overrides[track.file.name] = match.filename
+
                 # Build the upload list: new audio tracks first, then .m3u8 files
                 upload_items: list[UploadItem] = list(tracks_to_upload)
                 for pl in selected_playlists:
-                    content = generate_m3u8(pl).encode("utf-8")
+                    content = generate_m3u8(pl, name_override=m3u8_overrides).encode("utf-8")
                     upload_items.append(
                         InMemoryFile(
                             data=content,

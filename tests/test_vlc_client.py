@@ -15,6 +15,7 @@ from vlc_mobile_librarian.vlc_client import (
     VLCConnection,
     VLCConnectionError,
     VLCUploadError,
+    _parse_duration,
     authenticate,
     fetch_file_list,
     upload_bytes,
@@ -154,6 +155,32 @@ def test_fetch_file_list_handles_bad_size_and_duration():
     files = fetch_file_list(CONN, requests.Session())
     assert files[0].size == 0
     assert files[0].duration == 0
+
+
+@rsps.activate
+def test_fetch_file_list_parses_mmss_duration():
+    # Real VLC XML uses "MM:SS" or "HH:MM:SS" format, not raw seconds.
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <MediaLibrary>
+      <Media title="short.flac" size="0" duration="02:48"
+             pathfile="/download/%2Fshort.flac" thumb="" />
+      <Media title="long.flac" size="0" duration="1:02:48"
+             pathfile="/download/%2Flong.flac" thumb="" />
+    </MediaLibrary>"""
+    rsps.add(rsps.GET, f"{BASE}/libMediaVLC.xml", body=xml, content_type="application/xml")
+    files = fetch_file_list(CONN, requests.Session())
+    assert files[0].duration == 2 * 60 + 48  # 168
+    assert files[1].duration == 1 * 3600 + 2 * 60 + 48  # 3768
+
+
+def test_parse_duration_formats():
+    assert _parse_duration("") == 0
+    assert _parse_duration("240") == 240
+    assert _parse_duration("02:48") == 168
+    assert _parse_duration("1:02:48") == 3768
+    assert _parse_duration("0:00") == 0
+    assert _parse_duration("bad") == 0
+    assert _parse_duration("1:2:3:4") == 0  # too many parts
 
 
 @rsps.activate

@@ -8,17 +8,23 @@ from pathlib import Path
 import pytest
 
 from vlc_mobile_librarian.library import (
+    DuplicateReport,
     LocalFile,
     Playlist,
     PlaylistTrack,
     _build_order_clause,
     _build_smart_query,
     _canonical_vlc_name,
+    _durations_match,
+    _normalize_title,
     _resolve_mm_path,
+    build_vlc_index,
+    classify_local_file,
     compute_sync_plan,
     discover_track_types,
     find_potential_duplicates,
     generate_m3u8,
+    match_device_file,
     scan_library_from_mediamonkey,
     scan_playlists_from_mediamonkey,
 )
@@ -181,6 +187,93 @@ def test_sync_plan_vlc_empty_filename_ignored():
     ]
     plan = compute_sync_plan(local, vlc)
     assert len(plan.to_upload) == 1
+
+
+def _lft(name: str, title: str = "", duration_ms: int = 0) -> LocalFile:
+    """LocalFile builder with title and duration for likely_present tests."""
+    return LocalFile(
+        path=Path(f"/mnt/d/{name}"),
+        name=name,
+        size=0,
+        duration_ms=duration_ms,
+        title=title,
+    )
+
+
+def _vft_full(
+    title: str, filename: str, duration: int = 0
+) -> VLCFile:  # different from _vft above to avoid name clash; keeps tests local
+    return VLCFile(
+        title=title,
+        filename=filename,
+        size=0,
+        duration=duration,
+        thumb_url="",
+        download_url="",
+    )
+
+
+def test_sync_plan_likely_present_title_and_duration_match():
+    # Local file has different filename but same metadata title and duration as
+    # a device file - should land in likely_present, not to_upload.
+    local = [_lft("01-the_strokes-yolo.flac", title="You Only Live Once", duration_ms=189000)]
+    vlc = [_vft_full("You Only Live Once", "1 - You Only Live Once.mp3", duration=191)]
+    plan = compute_sync_plan(local, vlc)
+    assert plan.to_upload == []
+    assert plan.already_on_device == []
+    assert len(plan.likely_present) == 1
+
+
+def test_sync_plan_likely_present_no_title_falls_through_to_new():
+    # Local file with empty title can't title-match - goes to to_upload.
+    local = [_lft("song.flac", title="", duration_ms=200000)]
+    vlc = [_vft_full("Song", "device-song.mp3", duration=200)]
+    plan = compute_sync_plan(local, vlc)
+    assert len(plan.to_upload) == 1
+    assert plan.likely_present == []
+
+
+def test_sync_plan_likely_present_title_match_but_duration_off():
+    # Same title but durations far apart - distinct songs, must upload.
+    local = [_lft("hellfire.flac", title="Hellfire", duration_ms=180000)]
+    vlc = [_vft_full("Hellfire", "device-hellfire.mp3", duration=240)]
+    plan = compute_sync_plan(local, vlc)
+    assert len(plan.to_upload) == 1
+    assert plan.likely_present == []
+
+
+def test_sync_plan_filename_match_takes_precedence_over_title():
+    # If filename matches, classification stops there (no title check needed).
+    local = [_lft("song.mp3", title="Different Title", duration_ms=100000)]
+    vlc = [_vft_full("Other", "song.mp3", duration=999)]
+    plan = compute_sync_plan(local, vlc)
+    assert len(plan.already_on_device) == 1
+    assert plan.likely_present == []
+
+
+def test_sync_plan_likely_present_url_encoded_title():
+    # URL-encoded title on device matches plain title locally.
+    local = [_lft("a.flac", title="You Only Live Once", duration_ms=189000)]
+    vlc = [_vft_full("You%20Only%20Live%20Once", "b.mp3", duration=191)]
+    plan = compute_sync_plan(local, vlc)
+    assert len(plan.likely_present) == 1
+
+
+def test_sync_plan_three_buckets_independent():
+    local = [
+        _lft("matching.mp3", title="A", duration_ms=100000),  # filename match
+        _lft("local-yolo.flac", title="B Title", duration_ms=200000),  # title match
+        _lft("brand_new.mp3", title="Unique", duration_ms=300000),  # neither
+    ]
+    vlc = [
+        _vft_full("Whatever", "matching.mp3", duration=99),
+        _vft_full("B Title", "device-b.mp3", duration=201),
+    ]
+    plan = compute_sync_plan(local, vlc)
+    assert [f.name for f in plan.already_on_device] == ["matching.mp3"]
+    assert [f.name for f in plan.likely_present] == ["local-yolo.flac"]
+    assert [f.name for f in plan.to_upload] == ["brand_new.mp3"]
+    assert plan.total_local == 3
 
 
 # ── scan_library_from_mediamonkey ─────────────────────────────────────────────
@@ -445,6 +538,146 @@ def test_generate_m3u8_multiple_tracks():
     assert len(lines) == 1 + 3 * 2  # header + (EXTINF + filename) per track
 
 
+def test_generate_m3u8_name_override():
+    # Local file is "local.mp3" but the matching device file is "device.mp3";
+    # M3U8 should reference the device's filename so VLC can resolve it.
+    f = LocalFile(path=Path("/mnt/d/local.mp3"), name="local.mp3", size=0)
+    pl = _make_playlist([f])
+    out = generate_m3u8(pl, name_override={"local.mp3": "device.mp3"})
+    lines = out.splitlines()
+    assert lines[-1] == "device.mp3"
+
+
+def test_generate_m3u8_name_override_only_overrides_listed():
+    # Tracks not in the override map use their local filename.
+    tracks = [
+        LocalFile(path=Path("/mnt/d/a.mp3"), name="a.mp3", size=0),
+        LocalFile(path=Path("/mnt/d/b.mp3"), name="b.mp3", size=0),
+    ]
+    pl = _make_playlist(tracks)
+    out = generate_m3u8(pl, name_override={"a.mp3": "device-a.mp3"})
+    body = [ln for ln in out.splitlines() if not ln.startswith(("#", ""))]
+    body = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+    assert body == ["device-a.mp3", "b.mp3"]
+
+
+# ── build_vlc_index / classify_local_file / match_device_file ────────────────
+
+
+def test_build_vlc_index_groups_by_filename_and_title():
+    files = [
+        VLCFile(
+            title="Song A", filename="a.mp3", size=0, duration=100, thumb_url="", download_url=""
+        ),
+        VLCFile(
+            title="Song A",
+            filename="a-other.flac",
+            size=0,
+            duration=101,
+            thumb_url="",
+            download_url="",
+        ),
+    ]
+    idx = build_vlc_index(files)
+    assert "a.mp3" in idx.by_filename
+    assert "a-other.flac" in idx.by_filename
+    assert len(idx.by_title["song a"]) == 2
+
+
+def test_match_device_file_filename_priority():
+    files = [
+        VLCFile(
+            title="Different",
+            filename="local.mp3",
+            size=0,
+            duration=999,
+            thumb_url="",
+            download_url="",
+        ),
+    ]
+    idx = build_vlc_index(files)
+    local = LocalFile(
+        path=Path("/mnt/d/local.mp3"),
+        name="local.mp3",
+        size=0,
+        title="Whatever",
+        duration_ms=100000,
+    )
+    matched = match_device_file(local, idx)
+    assert matched is not None
+    assert matched.filename == "local.mp3"
+
+
+def test_match_device_file_title_duration_fallback():
+    files = [
+        VLCFile(
+            title="Hello", filename="hello.mp3", size=0, duration=180, thumb_url="", download_url=""
+        ),
+    ]
+    idx = build_vlc_index(files)
+    local = LocalFile(
+        path=Path("/mnt/d/different.flac"),
+        name="different.flac",
+        size=0,
+        title="Hello",
+        duration_ms=181000,
+    )
+    matched = match_device_file(local, idx)
+    assert matched is not None
+    assert matched.filename == "hello.mp3"
+
+
+def test_match_device_file_returns_none_when_no_match():
+    idx = build_vlc_index(
+        [
+            VLCFile(
+                title="Hello",
+                filename="hello.mp3",
+                size=0,
+                duration=100,
+                thumb_url="",
+                download_url="",
+            ),
+        ]
+    )
+    local = LocalFile(
+        path=Path("/mnt/d/x.mp3"), name="x.mp3", size=0, title="Goodbye", duration_ms=300000
+    )
+    assert match_device_file(local, idx) is None
+
+
+def test_classify_local_file_three_outcomes():
+    idx = build_vlc_index(
+        [
+            VLCFile(
+                title="A", filename="a.mp3", size=0, duration=100, thumb_url="", download_url=""
+            ),
+            VLCFile(
+                title="B Title",
+                filename="device-b.mp3",
+                size=0,
+                duration=200,
+                thumb_url="",
+                download_url="",
+            ),
+        ]
+    )
+    f_already = LocalFile(path=Path("/mnt/d/a.mp3"), name="a.mp3", size=0)
+    f_likely = LocalFile(
+        path=Path("/mnt/d/local-b.flac"),
+        name="local-b.flac",
+        size=0,
+        title="B Title",
+        duration_ms=200000,
+    )
+    f_new = LocalFile(
+        path=Path("/mnt/d/c.mp3"), name="c.mp3", size=0, title="C", duration_ms=999000
+    )
+    assert classify_local_file(f_already, idx) == "already_on_device"
+    assert classify_local_file(f_likely, idx) == "likely_present"
+    assert classify_local_file(f_new, idx) == "new"
+
+
 # ── scan_playlists_from_mediamonkey ───────────────────────────────────────────
 
 
@@ -572,57 +805,198 @@ def test_canonical_vlc_name_no_change_non_numeric():
     assert _canonical_vlc_name("song-remix.mp3") == "song-remix.mp3"
 
 
+# ── _normalize_title / _durations_match ──────────────────────────────────────
+
+
+def test_normalize_title_lowercases_and_collapses_punct():
+    assert _normalize_title("Why’d You Only Call Me?") == "why d you only call me"
+
+
+def test_normalize_title_strips_feat():
+    assert _normalize_title("Wasteland (feat. Aaron Richards)") == "wasteland"
+    assert _normalize_title("Wasteland (ft. Aaron)") == "wasteland"
+
+
+def test_normalize_title_strips_brackets():
+    assert _normalize_title("Track [Remastered 2009]") == "track"
+
+
+def test_normalize_title_url_decodes():
+    assert _normalize_title("You%20Only%20Live%20Once") == "you only live once"
+
+
+def test_normalize_title_empty():
+    assert _normalize_title("") == ""
+    assert _normalize_title("   ") == ""
+
+
+def test_durations_match_within_tolerance():
+    assert _durations_match(189, 191)  # 3:09 vs 3:11
+    assert _durations_match(189, 187)  # 3:09 vs 3:07
+    assert not _durations_match(180, 240)  # 3:00 vs 4:00
+
+
+def test_durations_match_zero_is_wildcard():
+    assert _durations_match(0, 240)
+    assert _durations_match(240, 0)
+    assert _durations_match(0, 0)
+
+
 # ── find_potential_duplicates ─────────────────────────────────────────────────
 
 
+def _vft(title: str, filename: str, duration: int = 0) -> VLCFile:
+    """VLCFile builder where title and filename can differ."""
+    return VLCFile(
+        title=title,
+        filename=filename,
+        size=0,
+        duration=duration,
+        thumb_url="",
+        download_url="",
+    )
+
+
 def test_find_potential_duplicates_empty():
-    assert find_potential_duplicates([]) == {}
+    report = find_potential_duplicates([])
+    assert isinstance(report, DuplicateReport)
+    assert report.high == report.medium == report.filename == []
+    assert report.total == 0
 
 
-def test_find_potential_duplicates_no_dups():
-    assert find_potential_duplicates([_vf("song.mp3"), _vf("other.flac")]) == {}
+def test_find_potential_duplicates_distinct_titles_no_dups():
+    # Distinct titles AND distinct canonical filenames - nothing groups
+    report = find_potential_duplicates([_vft("song-a", "a.mp3"), _vft("song-b", "b.flac")])
+    assert report.total == 0
 
 
-def test_find_potential_duplicates_basic_pair():
-    result = find_potential_duplicates([_vf("song.mp3"), _vf("song-1.mp3")])
-    assert list(result.keys()) == ["song.mp3"]
-    assert [f.filename for f in result["song.mp3"]] == ["song-1.mp3", "song.mp3"]
+def test_find_potential_duplicates_filename_tier_basic_pair():
+    # Same canonical filename via -N suffix; title differs so it lands only in
+    # the filename tier.
+    report = find_potential_duplicates([_vft("song-a", "song.mp3"), _vft("song-b", "song-1.mp3")])
+    assert len(report.filename) == 1
+    assert report.filename[0].key == "song.mp3"
+    assert [f.filename for f in report.filename[0].files] == ["song-1.mp3", "song.mp3"]
+    assert report.high == [] and report.medium == []
 
 
-def test_find_potential_duplicates_three_way_chain():
-    files = [_vf("song.mp3"), _vf("song-1.mp3"), _vf("song-2.mp3")]
-    result = find_potential_duplicates(files)
-    assert len(result) == 1
-    assert len(result["song.mp3"]) == 3
+def test_find_potential_duplicates_filename_tier_three_way_chain():
+    files = [_vft("a", "song.mp3"), _vft("b", "song-1.mp3"), _vft("c", "song-2.mp3")]
+    report = find_potential_duplicates(files)
+    assert len(report.filename) == 1
+    assert len(report.filename[0].files) == 3
 
 
-def test_find_potential_duplicates_numbered_only_no_original():
-    # song.mp3 was deleted but song-1.mp3 and song-2.mp3 remain - still duplicates
-    result = find_potential_duplicates([_vf("song-1.mp3"), _vf("song-2.mp3")])
-    assert list(result.keys()) == ["song.mp3"]
-    assert len(result["song.mp3"]) == 2
-
-
-def test_find_potential_duplicates_multiple_groups():
-    files = [
-        _vf("a.mp3"),
-        _vf("a-1.mp3"),
-        _vf("b.flac"),
-        _vf("b-1.flac"),
-        _vf("c.mp3"),  # no duplicate
-    ]
-    result = find_potential_duplicates(files)
-    assert set(result.keys()) == {"a.mp3", "b.flac"}
-    assert "c.mp3" not in result
+def test_find_potential_duplicates_filename_tier_numbered_only():
+    report = find_potential_duplicates([_vft("a", "song-1.mp3"), _vft("b", "song-2.mp3")])
+    assert len(report.filename) == 1
+    assert report.filename[0].key == "song.mp3"
 
 
 def test_find_potential_duplicates_same_filename_not_flagged():
-    # VLC XML lists the same file twice - should NOT be treated as a duplicate
-    assert find_potential_duplicates([_vf("song.mp3"), _vf("song.mp3")]) == {}
+    # VLC XML lists the same file twice - dedupe-by-filename should suppress it.
+    report = find_potential_duplicates([_vft("song", "song.mp3"), _vft("song", "song.mp3")])
+    assert report.total == 0
 
 
-def test_find_potential_duplicates_sorted_within_group():
-    # Files returned within each group are sorted by filename
-    result = find_potential_duplicates([_vf("song-2.mp3"), _vf("song.mp3"), _vf("song-1.mp3")])
-    names = [f.filename for f in result["song.mp3"]]
+def test_find_potential_duplicates_high_tier_same_title_close_durations():
+    # The "You Only Live Once" pattern: same title, formats differ, durations
+    # drift by a few seconds.
+    files = [
+        _vft("You Only Live Once", "01-yolo.flac", duration=189),
+        _vft("You Only Live Once", "1 - You Only Live Once.m4a", duration=187),
+        _vft("You Only Live Once", "1 - You Only Live Once.mp3", duration=191),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.high) == 1
+    assert len(report.high[0].files) == 3
+    assert report.medium == []
+
+
+def test_find_potential_duplicates_medium_tier_same_title_diff_duration():
+    # Same title, durations far apart - distinct songs that share a name.
+    files = [
+        _vft("Hellfire", "artist1-hellfire.flac", duration=180),
+        _vft("Hellfire", "artist2-hellfire.mp3", duration=240),
+    ]
+    report = find_potential_duplicates(files)
+    assert report.high == []
+    assert len(report.medium) == 1
+    assert len(report.medium[0].files) == 2
+
+
+def test_find_potential_duplicates_zero_duration_is_wildcard():
+    # One entry has duration 0 (corrupt upload) - still high confidence.
+    files = [
+        _vft("Track", "good.flac", duration=200),
+        _vft("Track", "corrupt.flac", duration=0),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.high) == 1
+    assert len(report.high[0].files) == 2
+
+
+def test_find_potential_duplicates_url_encoded_title_groups():
+    # URL-encoded vs decoded titles should normalize to the same key.
+    files = [
+        _vft("You%20Only%20Live%20Once", "a.flac", duration=189),
+        _vft("You Only Live Once", "b.mp3", duration=191),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.high) == 1
+
+
+def test_find_potential_duplicates_feat_annotation_stripped():
+    # "(feat. ...)" should be stripped before matching.
+    files = [
+        _vft("Wasteland", "a.flac", duration=200),
+        _vft("Wasteland (feat. Aaron Richards)", "b.flac", duration=200),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.high) == 1
+
+
+def test_find_potential_duplicates_empty_title_skipped():
+    # Files with empty titles are not grouped on title (only filename tier).
+    files = [_vft("", "a.flac", duration=200), _vft("", "b.flac", duration=200)]
+    report = find_potential_duplicates(files)
+    assert report.high == []
+    assert report.medium == []
+
+
+def test_find_potential_duplicates_split_bucket_high_and_medium():
+    # Three entries share title; two cluster on duration, one is far away.
+    # The cluster of 2 -> high; the lone outlier alone is not a group.
+    files = [
+        _vft("Track", "a.flac", duration=180),
+        _vft("Track", "b.flac", duration=181),
+        _vft("Track", "c.flac", duration=300),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.high) == 1
+    assert len(report.high[0].files) == 2
+    assert report.medium == []
+
+
+def test_find_potential_duplicates_files_sorted_within_group():
+    files = [
+        _vft("Track", "z.flac", duration=200),
+        _vft("Track", "a.flac", duration=200),
+        _vft("Track", "m.flac", duration=200),
+    ]
+    report = find_potential_duplicates(files)
+    names = [f.filename for f in report.high[0].files]
     assert names == sorted(names)
+
+
+def test_find_potential_duplicates_filename_tier_independent_from_title_tier():
+    # -N filename pair AND a separate title-based dup -> both surface.
+    files = [
+        _vft("Some Song", "some_song.mp3"),
+        _vft("Some Song different metadata", "some_song-1.mp3"),
+        _vft("Other Track", "x.flac", duration=200),
+        _vft("Other Track", "y.mp3", duration=201),
+    ]
+    report = find_potential_duplicates(files)
+    assert len(report.filename) == 1
+    assert len(report.high) == 1

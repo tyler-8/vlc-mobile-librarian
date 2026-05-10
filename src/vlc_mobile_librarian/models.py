@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -35,6 +35,11 @@ class SyncPlan:
     to_upload: list[LocalFile]
     already_on_device: list[LocalFile]
     total_local: int
+    # Files whose bare filename does not match any device file but whose
+    # normalized metadata title and duration match an entry on the device -
+    # likely the same song under a different filename. Surfaced separately so
+    # the user can override per-file before uploading.
+    likely_present: list[LocalFile] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

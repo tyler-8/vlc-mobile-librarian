@@ -88,6 +88,29 @@ def authenticate(conn: VLCConnection) -> requests.Session:
     return session
 
 
+def _parse_duration(raw: str) -> int:
+    """Parse VLC's duration attribute into integer seconds.
+
+    Accepts plain seconds ("240"), "MM:SS" ("02:48"), and "HH:MM:SS" ("1:02:48").
+    Returns 0 on malformed input.
+    """
+    if not raw:
+        return 0
+    parts = raw.split(":")
+    try:
+        if len(parts) == 1:
+            return max(int(parts[0]), 0)
+        if len(parts) == 2:
+            m, s = int(parts[0]), int(parts[1])
+            return max(m * 60 + s, 0)
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+            return max(h * 3600 + m * 60 + s, 0)
+    except ValueError:
+        return 0
+    return 0
+
+
 def fetch_file_list(conn: VLCConnection, session: requests.Session) -> list[VLCFile]:
     """Fetch the XML library listing from the VLC device.
 
@@ -116,10 +139,7 @@ def fetch_file_list(conn: VLCConnection, session: requests.Session) -> list[VLCF
             size = int(media.get("size", 0))
         except ValueError:
             size = 0
-        try:
-            duration = int(media.get("duration", 0))
-        except ValueError:
-            duration = 0
+        duration = _parse_duration(media.get("duration", ""))
         download_url = media.get("pathfile", "")
         # Extract the bare filename from the download URL.
         # pathfile encodes the full iOS path as a single URL segment, e.g.:
