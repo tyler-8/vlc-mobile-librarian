@@ -18,7 +18,7 @@ class ConfigField:
     Attributes:
         key:         Key in the settings dict passed to from_settings().
         label:       Human-readable UI label.
-        field_type:  Controls which Streamlit widget is rendered.
+        field_type:  Controls which input widget the UI renders.
         placeholder: Hint text shown when the field is empty.
         default:     Static fallback used when autodetect returns None.
         autodetect:  Optional callable that attempts to find the value

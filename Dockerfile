@@ -13,12 +13,11 @@ COPY README.md ./
 COPY src/ ./src/
 RUN uv sync --no-dev --frozen
 
-ENV STREAMLIT_SERVER_HEADLESS=true \
-    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
-    STREAMLIT_SERVER_PORT=8501 \
-    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
-    UV_LINK_MODE=copy
+# NiceGUI binds to 0.0.0.0 by default. Disable its auto-open-browser in headless
+# containers so it doesn't spend startup trying to launch a browser that isn't there.
+ENV UV_LINK_MODE=copy \
+    VLC_LIBRARIAN_NO_SHOW=1
 
-EXPOSE 8501
+EXPOSE 8080
 
-CMD ["uv", "run", "streamlit", "run", "src/vlc_mobile_librarian/app.py"]
+CMD ["uv", "run", "vlc-librarian", "--port", "8080"]

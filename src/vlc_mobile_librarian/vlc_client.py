@@ -171,12 +171,16 @@ def upload_file(
     session: requests.Session,
     file_path: Path,
     progress_callback: Callable[[int, int], None] | None = None,
+    upload_name: str | None = None,
 ) -> None:
     """Upload a file to the VLC device via multipart/form-data POST.
 
     progress_callback(bytes_sent, bytes_total) is called after each chunk.
-    Raises VLCUploadError on failure.
+    `upload_name` overrides the filename VLC stores the file under (defaults to
+    the on-disk name) - used when uploading a transcoded temp file under its
+    original-but-re-extensioned name. Raises VLCUploadError on failure.
     """
+    name = upload_name or file_path.name
 
     def _monitor_callback(monitor: MultipartEncoderMonitor) -> None:
         if progress_callback is not None:
@@ -185,7 +189,7 @@ def upload_file(
     try:
         with open(file_path, "rb") as fh:
             encoder = MultipartEncoderMonitor.from_fields(
-                fields={"files[]": (file_path.name, fh, "application/octet-stream")},
+                fields={"files[]": (name, fh, "application/octet-stream")},
                 callback=_monitor_callback,
             )
             try:
@@ -196,14 +200,12 @@ def upload_file(
                     timeout=300,  # large files over Wi-Fi can be slow
                 )
             except requests.exceptions.ConnectionError as e:
-                raise VLCUploadError(
-                    f"Connection lost during upload of {file_path.name}: {e}"
-                ) from e
+                raise VLCUploadError(f"Connection lost during upload of {name}: {e}") from e
             except requests.exceptions.Timeout:
-                raise VLCUploadError(f"Timed out uploading {file_path.name}") from None
+                raise VLCUploadError(f"Timed out uploading {name}") from None
 
             if resp.status_code != 200:
-                raise VLCUploadError(f"VLC returned HTTP {resp.status_code} for {file_path.name}")
+                raise VLCUploadError(f"VLC returned HTTP {resp.status_code} for {name}")
     except OSError as e:
         raise VLCUploadError(f"Cannot open {file_path}: {e}") from e
 

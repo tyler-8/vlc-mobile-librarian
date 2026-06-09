@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from queue import Empty
 from unittest.mock import MagicMock, patch
 
 from vlc_mobile_librarian.models import LocalFile
+from vlc_mobile_librarian.transcode import TranscodeOptions
 from vlc_mobile_librarian.uploader import (
     InMemoryFile,
     UploadEvent,
@@ -75,7 +77,9 @@ def test_local_file_upload_success(tmp_path: Path):
         job = start_upload_job([local], CONN)
         events = _collect_events(job)
 
-    mock_auth.assert_called_once_with(CONN)
+    # Authenticated at least once (a connectivity probe + per-worker sessions).
+    assert mock_auth.call_count >= 1
+    assert mock_auth.call_args == ((CONN,),)
     mock_upload.assert_called_once()
     assert mock_upload.call_args[0][2] == f  # file path passed through
 
@@ -129,6 +133,32 @@ def test_multiple_files_all_succeed(tmp_path: Path):
 
     assert UploadStatus.DONE in _statuses(events, "a.mp3")
     assert UploadStatus.DONE in _statuses(events, "b.mp3")
+
+
+def test_uploads_run_concurrently(tmp_path: Path):
+    # A Barrier of 3 only releases once 3 uploads are in-flight simultaneously.
+    # If uploads ran sequentially, barrier.wait() would time out and raise,
+    # turning every file into an ERROR and failing the DONE assertions below.
+    files = []
+    for i in range(3):
+        p = tmp_path / f"s{i}.mp3"
+        p.write_bytes(b"x")
+        files.append(LocalFile(path=p, name=f"s{i}.mp3", size=1))
+
+    barrier = threading.Barrier(3, timeout=5)
+
+    def fake_upload(conn, session, path, progress_callback=None):
+        barrier.wait()  # blocks until all 3 uploads are running concurrently
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.upload_file", side_effect=fake_upload),
+    ):
+        job = start_upload_job(files, CONN, concurrency=3)
+        events = _collect_events(job, timeout=10)
+
+    for i in range(3):
+        assert UploadStatus.DONE in _statuses(events, f"s{i}.mp3")
 
 
 # ── start_upload_job - auth failure ───────────────────────────────────────────
@@ -191,6 +221,146 @@ def test_upload_error_continues_with_remaining_files(tmp_path: Path):
 
     assert UploadStatus.ERROR in _statuses(events, "fails.mp3")
     assert UploadStatus.DONE in _statuses(events, "ok.mp3")
+
+
+# ── transcoding ────────────────────────────────────────────────────────────────
+
+
+def test_transcode_lossless_encodes_and_uploads_opus_name(tmp_path: Path):
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"flac")
+    local = LocalFile(path=f, name="song.flac", size=4)
+    opus = tmp_path / "cached.opus"
+    opus.write_bytes(b"opus")
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode", return_value=opus) as mock_tc,
+        patch("vlc_mobile_librarian.uploader.upload_file") as mock_upload,
+    ):
+        job = start_upload_job(
+            [local], CONN, transcode=TranscodeOptions(enabled=True, bitrate_kbps=128)
+        )
+        events = _collect_events(job)
+
+    mock_tc.assert_called_once()
+    # Uploads the transcoded temp file, but under the .opus display name
+    assert mock_upload.call_args[0][2] == opus
+    assert mock_upload.call_args.kwargs["upload_name"] == "song.opus"
+
+    statuses = _statuses(events, "song.flac")
+    assert UploadStatus.TRANSCODING in statuses
+    assert UploadStatus.DONE in statuses
+
+
+def test_transcode_runs_encodes_in_parallel(tmp_path: Path):
+    # A Barrier of N only releases once N encodes are in-flight simultaneously.
+    # If encodes ran sequentially, barrier.wait() would time out and raise,
+    # turning every file into an ERROR and failing the DONE assertions below.
+    files = []
+    for i in range(3):
+        p = tmp_path / f"s{i}.flac"
+        p.write_bytes(b"x")
+        files.append(LocalFile(path=p, name=f"s{i}.flac", size=1))
+
+    barrier = threading.Barrier(3, timeout=5)
+
+    def fake_tc(path: Path, opts: TranscodeOptions) -> Path:
+        barrier.wait()  # blocks until all 3 encodes are running concurrently
+        out = tmp_path / f"{path.stem}.cached"
+        out.write_bytes(b"o")
+        return out
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode", side_effect=fake_tc),
+        patch("vlc_mobile_librarian.uploader.upload_file") as mock_upload,
+    ):
+        job = start_upload_job(files, CONN, transcode=TranscodeOptions(enabled=True, max_workers=3))
+        events = _collect_events(job, timeout=10)
+
+    for i in range(3):
+        assert UploadStatus.DONE in _statuses(events, f"s{i}.flac")
+    uploaded_names = {c.kwargs["upload_name"] for c in mock_upload.call_args_list}
+    assert uploaded_names == {"s0.opus", "s1.opus", "s2.opus"}
+
+
+def test_transcode_skips_already_lossy_files(tmp_path: Path):
+    f = tmp_path / "song.mp3"
+    f.write_bytes(b"mp3")
+    local = LocalFile(path=f, name="song.mp3", size=3)
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode") as mock_tc,
+        patch("vlc_mobile_librarian.uploader.upload_file") as mock_upload,
+    ):
+        job = start_upload_job([local], CONN, transcode=TranscodeOptions(enabled=True))
+        _collect_events(job)
+
+    mock_tc.assert_not_called()
+    # Uploaded unchanged - original path, no upload_name override
+    assert mock_upload.call_args[0][2] == f
+    assert mock_upload.call_args.kwargs.get("upload_name") is None
+
+
+def test_transcode_disabled_does_not_encode_lossless(tmp_path: Path):
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"flac")
+    local = LocalFile(path=f, name="song.flac", size=4)
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode") as mock_tc,
+        patch("vlc_mobile_librarian.uploader.upload_file") as mock_upload,
+    ):
+        job = start_upload_job([local], CONN, transcode=TranscodeOptions(enabled=False))
+        _collect_events(job)
+
+    mock_tc.assert_not_called()
+    assert mock_upload.call_args[0][2] == f
+
+
+def test_cache_pruned_after_batch_when_cap_set(tmp_path: Path):
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"flac")
+    local = LocalFile(path=f, name="song.flac", size=4)
+    opus = tmp_path / "cached.opus"
+    opus.write_bytes(b"opus")
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode", return_value=opus),
+        patch("vlc_mobile_librarian.uploader.upload_file"),
+        patch("vlc_mobile_librarian.uploader.prune_cache") as mock_prune,
+    ):
+        job = start_upload_job(
+            [local], CONN, transcode=TranscodeOptions(enabled=True, cache_cap_bytes=5000)
+        )
+        _collect_events(job)
+
+    mock_prune.assert_called_once_with(5000)
+
+
+def test_cache_not_pruned_when_cap_zero(tmp_path: Path):
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"flac")
+    local = LocalFile(path=f, name="song.flac", size=4)
+    opus = tmp_path / "cached.opus"
+    opus.write_bytes(b"opus")
+
+    with (
+        patch("vlc_mobile_librarian.uploader.authenticate", return_value=MagicMock()),
+        patch("vlc_mobile_librarian.uploader.cached_transcode", return_value=opus),
+        patch("vlc_mobile_librarian.uploader.upload_file"),
+        patch("vlc_mobile_librarian.uploader.prune_cache") as mock_prune,
+    ):
+        job = start_upload_job(
+            [local], CONN, transcode=TranscodeOptions(enabled=True, cache_cap_bytes=0)
+        )
+        _collect_events(job)
+
+    mock_prune.assert_not_called()
 
 
 # ── sentinel ───────────────────────────────────────────────────────────────────

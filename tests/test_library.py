@@ -276,6 +276,44 @@ def test_sync_plan_three_buckets_independent():
     assert plan.total_local == 3
 
 
+# ── compute_sync_plan with project_name (transcoding) ─────────────────────────
+
+
+def _opus_projector(f: LocalFile) -> str:
+    """Mimic the app's transcoding projector: lossless .flac -> .opus."""
+    return Path(f.name).with_suffix(".opus").name if f.name.endswith(".flac") else f.name
+
+
+def test_sync_plan_projector_recognizes_transcoded_file():
+    # A FLAC that was previously transcoded and uploaded lives on the device as
+    # .opus. With the projector, it must classify as already_on_device.
+    local = [_lf("song.flac")]
+    vlc = [_vf("song.opus")]
+
+    plan = compute_sync_plan(local, vlc, project_name=_opus_projector)
+    assert [f.name for f in plan.already_on_device] == ["song.flac"]
+    assert plan.to_upload == []
+
+
+def test_sync_plan_without_projector_only_likely_present():
+    # Same setup, but no projector: filename "song.flac" != "song.opus", so the
+    # title/duration fallback is the best we can do -> likely_present, not
+    # already_on_device. This is exactly what the projector fixes.
+    local = [_lft("song.flac", title="Song", duration_ms=180000)]
+    vlc = [_vft_full("Song", "song.opus", duration=180)]
+
+    plan = compute_sync_plan(local, vlc)
+    assert [f.name for f in plan.likely_present] == ["song.flac"]
+    assert plan.already_on_device == []
+
+
+def test_sync_plan_projector_leaves_lossy_untouched():
+    # Projector is identity for non-lossless files; an mp3 still matches by name.
+    local = [_lf("song.mp3")]
+    plan = compute_sync_plan(local, [_vf("song.mp3")], project_name=_opus_projector)
+    assert [f.name for f in plan.already_on_device] == ["song.mp3"]
+
+
 # ── scan_library_from_mediamonkey ─────────────────────────────────────────────
 
 

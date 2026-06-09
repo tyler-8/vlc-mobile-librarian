@@ -11,6 +11,7 @@ Existing imports from vlc_mobile_librarian.library continue to work unchanged.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
@@ -117,15 +118,24 @@ def build_vlc_index(vlc_files: list[VLCFile]) -> VLCDeviceIndex:
     return VLCDeviceIndex(by_filename=by_filename, by_title=by_title)
 
 
-def match_device_file(local: LocalFile, index: VLCDeviceIndex) -> VLCFile | None:
+def match_device_file(
+    local: LocalFile,
+    index: VLCDeviceIndex,
+    project_name: Callable[[LocalFile], str] | None = None,
+) -> VLCFile | None:
     """Return the VLCFile on the device that matches `local`, or None.
 
     Match priority: exact bare filename, then normalized title with a duration
     within tolerance. The returned `VLCFile.filename` is the name the device
     uses for that song - useful when generating M3U8 playlists so references
     point to the file that actually exists on the device.
+
+    `project_name`, when given, maps a LocalFile to the filename it will actually
+    be uploaded under (e.g. a transcoded `.opus` name) so matching reflects what
+    lands on the device rather than the source filename.
     """
-    vf = index.by_filename.get(local.name)
+    name = project_name(local) if project_name else local.name
+    vf = index.by_filename.get(name)
     if vf is not None:
         return vf
     nt = _normalize_title(local.title)
@@ -137,7 +147,11 @@ def match_device_file(local: LocalFile, index: VLCDeviceIndex) -> VLCFile | None
     return None
 
 
-def classify_local_file(local: LocalFile, index: VLCDeviceIndex) -> str:
+def classify_local_file(
+    local: LocalFile,
+    index: VLCDeviceIndex,
+    project_name: Callable[[LocalFile], str] | None = None,
+) -> str:
     """Classify a single local file against the device index.
 
     Returns one of:
@@ -145,8 +159,14 @@ def classify_local_file(local: LocalFile, index: VLCDeviceIndex) -> str:
       "likely_present"    - normalized title matches AND duration matches
                             (within tolerance) some device entry
       "new"               - no match
+
+    `project_name`, when given, maps a LocalFile to the filename it will actually
+    be uploaded under (e.g. a transcoded `.opus` name), so a re-encoded file
+    already on the device is recognized as `already_on_device` rather than being
+    re-flagged every sync.
     """
-    if local.name in index.by_filename:
+    name = project_name(local) if project_name else local.name
+    if name in index.by_filename:
         return "already_on_device"
     nt = _normalize_title(local.title)
     if nt:
@@ -160,6 +180,7 @@ def classify_local_file(local: LocalFile, index: VLCDeviceIndex) -> str:
 def compute_sync_plan(
     local_files: list[LocalFile],
     vlc_files: list[VLCFile],
+    project_name: Callable[[LocalFile], str] | None = None,
 ) -> SyncPlan:
     """Determine which local files are new vs. already on the device.
 
@@ -173,6 +194,10 @@ def compute_sync_plan(
         different filename convention. Surfaced for user override - not
         auto-skipped.
       - to_upload:         no match by either filename or title+duration.
+
+    `project_name`, when given, maps each LocalFile to the filename it will be
+    uploaded under (e.g. a transcoded `.opus` name) so classification reflects
+    what actually lands on the device.
     """
     index = build_vlc_index(vlc_files)
 
@@ -181,7 +206,7 @@ def compute_sync_plan(
     likely_present: list[LocalFile] = []
 
     for f in local_files:
-        kind = classify_local_file(f, index)
+        kind = classify_local_file(f, index, project_name)
         if kind == "already_on_device":
             already_on_device.append(f)
         elif kind == "likely_present":

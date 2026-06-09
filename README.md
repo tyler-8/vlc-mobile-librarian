@@ -1,6 +1,6 @@
 # vlc-mobile-librarian
 
-A local Streamlit app for syncing music from your PC to [VLC for iPhone](https://apps.apple.com/us/app/vlc-for-mobile/id650377962) via its built-in **[Sharing via Wi-Fi](https://docs.videolan.me/vlc-user/ios/3.X/en/gettingstarted/media_synchronization.html?highlight=wifi#share-via-wi-fi)** feature.
+A local web app for syncing music from your PC to [VLC for iPhone](https://apps.apple.com/us/app/vlc-for-mobile/id650377962) via its built-in **[Sharing via Wi-Fi](https://docs.videolan.me/vlc-user/ios/3.X/en/gettingstarted/media_synchronization.html?highlight=wifi#share-via-wi-fi)** feature.
 
 VLC's browser upload has no duplicate detection and no library management. This app reads your [MediaMonkey](https://www.mediamonkey.com/) library database, diffs it against what's already on the device, and lets you upload only the new files - with per-file progress bars.
 
@@ -24,6 +24,7 @@ VLC's browser upload has no duplicate detection and no library management. This 
 - VLC for iPhone with **Sharing via Wi-Fi** enabled (Settings → Wi-Fi Sharing)
 - Your PC and iPhone on the same Wi-Fi network
 - Running on Windows natively, or inside WSL2 (with Windows drives mounted at `/mnt/c`, `/mnt/d`, etc.)
+- **[ffmpeg](https://ffmpeg.org/)** on your `PATH` - optional, only needed for the "Convert lossless → Opus" transcoding feature
 
 ## Setup
 
@@ -41,7 +42,7 @@ If you'd prefer not to install Python and uv locally, you can run the app with D
 docker compose up --build
 ```
 
-Then open [http://localhost:8501](http://localhost:8501) in your browser.
+Then open [http://localhost:8080](http://localhost:8080) in your browser.
 
 ### Mounting your music library
 
@@ -76,7 +77,7 @@ A named Docker volume (`app-config`) stores your VLC connection settings and tra
 uv run vlc-librarian
 ```
 
-Then open [http://localhost:8501](http://localhost:8501) in your browser.
+Then open [http://localhost:8080](http://localhost:8080) in your browser.
 
 ### Workflow
 
@@ -92,6 +93,17 @@ Then open [http://localhost:8501](http://localhost:8501) in your browser.
 
 5. **Refresh** - After uploading, click **Clear & refresh** to re-diff against the updated device library.
 
+### Transcoding to Opus
+
+If you'd rather not fill your phone with large lossless files, enable **Convert lossless → Opus before upload** in the sidebar (requires ffmpeg). When on:
+
+- **Lossless** sources (FLAC/WAV/AIFF) are re-encoded to [Opus](https://opus-codec.org/) - the best quality-per-byte modern codec, and natively decoded by VLC - at the chosen bitrate (default 128 kbps VBR, transparent for music) just before upload, landing on the device as `*.opus`.
+- **Already-lossy** files (MP3/AAC/Opus) are uploaded unchanged - re-encoding them would only lose quality.
+- **Encodes run in parallel.** Over fast local Wi-Fi, encoding is the bottleneck, so files are transcoded concurrently on a thread pool (one ffmpeg process per worker) while uploads proceed. The number of simultaneous encodes is configurable via **Parallel encodes** in the sidebar (defaults to your CPU core count).
+- Encodes are cached under `~/.cache/vlc-mobile-librarian/transcode/` and keyed by source path + modified time + bitrate, so re-syncs (and retries after a failed sync) reuse finished encodes instead of redoing them. Tags and embedded cover art are carried over.
+- **Cache management.** After each sync, the oldest cached encodes are evicted to keep the cache under the **Cache size limit (GB)** set in the sidebar (default 5 GB; set 0 for no limit). The sidebar also shows the current cache size and a **Clear transcode cache** button to wipe it on demand (disabled mid-sync). Clearing is always safe - the cache is pure derived data and is re-created as needed.
+- Duplicate detection and playlist (`.m3u8`) references account for the renamed `.opus` files, so a transcoded track already on the device is recognized on the next sync.
+
 ## Notes
 
 - **Custom DB path** - set the `MM_DB_PATH` environment variable to skip auto-discovery and use a specific database file:
@@ -99,6 +111,11 @@ Then open [http://localhost:8501](http://localhost:8501) in your browser.
   MM_DB_PATH="/mnt/d/Users/me/AppData/Roaming/MediaMonkey5/MM5.DB" uv run vlc-librarian
   ```
 - **Duplicate detection** is by filename only (case-sensitive). `Song.mp3` and `song.mp3` are treated as different files.
+- **Terminal logs** - the app logs sync activity (transcode start/finish with timings, per-file upload start/finish, errors, and a final batch summary) to the terminal it's running in. For more detail (cache hits, encode waits) set the log level:
+  ```bash
+  VLC_LIBRARIAN_LOG_LEVEL=DEBUG uv run vlc-librarian
+  ```
+  The terminal log is the reliable source of truth if the in-browser progress bars ever look stuck under heavy CPU load.
 - **No delete support** - VLC's Wi-Fi sharing API has no delete endpoint. Remove files from within the VLC app on your phone.
 - The library is cached per DB path; click **Load** again to pick up changes made in MediaMonkey since the last load.
 - Only local audio tracks (`TrackType = 0`) from local drives are included. Podcasts, videos, and network sources are excluded.

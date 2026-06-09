@@ -2,7 +2,7 @@ services:
   vlc-mobile-librarian:
     build: .
     ports:
-      - "8501:8501"
+      - "8080:8080"
     volumes:
       # Live-reload: reflects code changes without rebuilding the image
       - .:/app
@@ -19,7 +19,7 @@ services:
       - /mnt/d:/mnt/d:ro
       # To override the MediaMonkey DB path, add an environment section:
     environment:
-      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - VLC_LIBRARIAN_NO_SHOW=1
       # - MM_DB_PATH: /mnt/d/Users/YourName/AppData/Roaming/MediaMonkey5/MM5.DB
       # If /mnt/c is mounted above, auto-detection handles the standard AppData location.
 
